@@ -1,0 +1,25 @@
+# Ignore the target directory (compiled binaries)
+target/
+
+# Ignore Cargo.lock for libraries (keep it for binaries)
+Cargo.lock
+
+# Ignore build artifacts and intermediate files
+*.rlib
+
+# Ignore editor-specific and OS-generated files
+*.swp
+*.swo
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Ignore compiled binaries
+**/*.exe
+**/*.out
+**/*.o
+**/*.dSYM/
+
+# Ignore dependency directories (if applicable)
+node_modules/
