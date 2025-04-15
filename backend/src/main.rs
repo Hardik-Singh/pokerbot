@@ -193,7 +193,7 @@ fn simulate_win_probability(
     other_players_cards: &[Vec<Card>],
     community_cards: &[Card],
     remaining_deck: &[Card],
-    num_simulations: usize,
+    num_simulations: 1000000,
 ) -> f64 {
     // If there are no opponents, the win probability is 100%.
     if other_players_cards.is_empty() {
