@@ -26,9 +26,13 @@ export interface Card {
     rank: Rank;
 }
 
+export interface Player {
+    cards: Card[];
+    win_probability: number;
+}
+
 export interface GameState {
     deck: Card[];
-    player_cards: Card[];
-    opponent_cards: Card[];
+    players: Player[];
     community_cards: Card[];
 } 
