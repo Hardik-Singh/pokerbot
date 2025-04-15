@@ -80,13 +80,15 @@ impl Card {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// Represents a 5-card hand with an evaluation (hand type) and the card values used for tie-breaking.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 struct Hand {
     hand_type: HandType,
     values: Vec<u8>,
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// Enumeration of poker hand types.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 enum HandType {
     HighCard,
     Pair,
@@ -99,36 +101,37 @@ enum HandType {
     StraightFlush,
 }
 
+/// Evaluates a 5-card hand.
 fn evaluate_hand(cards: &[Card]) -> Hand {
     let mut values: Vec<u8> = cards.iter().map(|c| c.value()).collect();
     values.sort_unstable_by(|a, b| b.cmp(a));
-    
-    // Check for flush
+
+    // Check flush (all cards have the same suit)
     let is_flush = cards.iter().all(|c| c.suit == cards[0].suit);
-    
-    // Check for straight
+
+    // Check straight (sequential values)
     let mut is_straight = false;
     if values.windows(2).all(|w| w[0] == w[1] + 1) {
         is_straight = true;
     } else if values == vec![14, 5, 4, 3, 2] {
-        // Special case: Ace-low straight
+        // Special case for Ace-low straight
         is_straight = true;
         values = vec![5, 4, 3, 2, 1];
     }
-    
-    // Count frequencies
+
+    // Count frequencies of card values
     let mut freq = std::collections::HashMap::new();
     for &v in &values {
         *freq.entry(v).or_insert(0) += 1;
     }
     let mut freq_vec: Vec<_> = freq.into_iter().collect();
-    freq_vec.sort_by_key(|&(v, c)| (-(c as i32), -(v as i32)));
-    
+    freq_vec.sort_by_key(|&(v, count)| (-(count as i32), -(v as i32)));
+
     let hand_type = if is_flush && is_straight {
         HandType::StraightFlush
     } else if freq_vec[0].1 == 4 {
         HandType::FourOfAKind
-    } else if freq_vec[0].1 == 3 && freq_vec[1].1 == 2 {
+    } else if freq_vec[0].1 == 3 && freq_vec.get(1).map_or(0, |&(_, c)| c) == 2 {
         HandType::FullHouse
     } else if is_flush {
         HandType::Flush
@@ -136,138 +139,131 @@ fn evaluate_hand(cards: &[Card]) -> Hand {
         HandType::Straight
     } else if freq_vec[0].1 == 3 {
         HandType::ThreeOfAKind
-    } else if freq_vec[0].1 == 2 && freq_vec[1].1 == 2 {
+    } else if freq_vec[0].1 == 2 && freq_vec.get(1).map_or(0, |&(_, c)| c) == 2 {
         HandType::TwoPair
     } else if freq_vec[0].1 == 2 {
         HandType::Pair
     } else {
         HandType::HighCard
     };
-    
+
     Hand { hand_type, values }
 }
 
-fn simulate_win_probability(player_cards: &[Card], other_players_cards: &[Vec<Card>], community_cards: &[Card], remaining_deck: &[Card], num_simulations: usize) -> f64 {
-    let mut wins = 0;
-    let mut ties = 0;
-    let mut rng = rand::thread_rng();
-    
-    // If no other players, return 100% win probability
+/// Generates all combinations of `k` items from a slice.
+fn combinations<T: Clone>(items: &[T], k: usize) -> Vec<Vec<T>> {
+    if k == 0 {
+        return vec![vec![]];
+    }
+    if items.len() < k {
+        return vec![];
+    }
+
+    let mut result = Vec::new();
+    // For each index, combine the current item with all combinations of the remaining items.
+    for (i, item) in items.iter().enumerate() {
+        let rest_combos = combinations(&items[i + 1..], k - 1);
+        for mut combo in rest_combos {
+            let mut new_combo = vec![item.clone()];
+            new_combo.append(&mut combo);
+            result.push(new_combo);
+        }
+    }
+    result
+}
+
+/// Evaluates the best possible 5-card hand out of a collection of cards.
+fn evaluate_best_hand(cards: &[Card]) -> Hand {
+    assert!(cards.len() >= 5, "At least 5 cards are required to evaluate a hand");
+    if cards.len() == 5 {
+        return evaluate_hand(cards);
+    }
+    combinations(cards, 5)
+        .into_iter()
+        .map(|combo| evaluate_hand(&combo))
+        .max()
+        .unwrap()
+}
+
+/// Simulates the win probability of a player's hand against opponents using Monte Carlo simulation.
+/// It completes the community board with cards drawn from the remaining deck, then
+/// evaluates every player's best hand and awards the win fraction when a tie occurs.
+fn simulate_win_probability(
+    player_cards: &[Card],
+    other_players_cards: &[Vec<Card>],
+    community_cards: &[Card],
+    remaining_deck: &[Card],
+    num_simulations: usize,
+) -> f64 {
+    // If there are no opponents, the win probability is 100%.
     if other_players_cards.is_empty() {
         return 1.0;
     }
-    
-    // If we don't have enough cards in the deck for simulation, return equal probability
-    let total_needed_cards = 5 - community_cards.len(); // cards needed to complete board
-    if remaining_deck.len() < total_needed_cards {
+
+    let total_needed = 5usize.saturating_sub(community_cards.len());
+    if remaining_deck.len() < total_needed {
         return 1.0 / (other_players_cards.len() as f64 + 1.0);
     }
-    
+
+    let mut total_win = 0.0;
+    let mut rng = rand::thread_rng();
+
     for _ in 0..num_simulations {
-        let mut simulation_deck = remaining_deck.to_vec();
-        simulation_deck.shuffle(&mut rng);
-        
-        // Complete the community cards
-        let mut final_community = community_cards.to_vec();
-        while final_community.len() < 5 {
-            if let Some(card) = simulation_deck.pop() {
-                final_community.push(card);
-            } else {
-                // If we run out of cards, return equal probability
-                return 1.0 / (other_players_cards.len() as f64 + 1.0);
+        let mut sim_deck = remaining_deck.to_vec();
+        sim_deck.shuffle(&mut rng);
+
+        // Complete the community board.
+        let mut final_board = community_cards.to_vec();
+        final_board.extend(sim_deck.into_iter().take(total_needed));
+
+        // Evaluate best hand for the player.
+        let player_best = evaluate_best_hand(&[player_cards, &final_board].concat());
+
+        // Evaluate each opponent's best hand.
+        let mut all_hands = vec![player_best.clone()];
+        for other in other_players_cards {
+            let other_best = evaluate_best_hand(&[other, &final_board].concat());
+            all_hands.push(other_best);
+        }
+
+        // Identify the maximum hand and count how many players achieved it.
+        if let Some(max_hand) = all_hands.iter().max() {
+            let tie_count = all_hands.iter().filter(|&hand| hand == max_hand).count() as f64;
+            if player_best == *max_hand {
+                total_win += 1.0 / tie_count;
             }
-        }
-        
-        // Evaluate all hands
-        let mut all_hands: Vec<Hand> = Vec::new();
-        
-        // Player's hand
-        let mut player_all_cards = player_cards.to_vec();
-        player_all_cards.extend(final_community.iter().cloned());
-        if player_all_cards.len() >= 5 {
-            all_hands.push(evaluate_hand(&player_all_cards));
-        } else {
-            // Not enough cards, return equal probability
-            return 1.0 / (other_players_cards.len() as f64 + 1.0);
-        }
-        
-        // Other players' hands
-        for other_cards in other_players_cards {
-            let mut other_all_cards = other_cards.to_vec();
-            other_all_cards.extend(final_community.iter().cloned());
-            if other_all_cards.len() >= 5 {
-                all_hands.push(evaluate_hand(&other_all_cards));
-            } else {
-                // Not enough cards, return equal probability
-                return 1.0 / (other_players_cards.len() as f64 + 1.0);
-            }
-        }
-        
-        // Check if player wins or ties
-        let player_hand = &all_hands[0];
-        let mut is_win = true;
-        let mut is_tie = true;
-        
-        for other_hand in &all_hands[1..] {
-            match other_hand.cmp(player_hand) {
-                Ordering::Greater => {
-                    is_win = false;
-                    is_tie = false;
-                    break;
-                }
-                Ordering::Less => {
-                    is_tie = false;
-                }
-                Ordering::Equal => {
-                    is_win = false;
-                }
-            }
-        }
-        
-        if is_win {
-            wins += 1;
-        } else if is_tie {
-            ties += 1;
         }
     }
-    
-    if num_simulations > 0 {
-        (wins as f64 + (ties as f64 * 0.5)) / num_simulations as f64
-    } else {
-        1.0 / (other_players_cards.len() as f64 + 1.0) // Equal probability if no simulations
-    }
+
+    total_win / num_simulations as f64
 }
 
 impl GameState {
+    /// Creates a new game with the specified number of players (between 2 and 8).
     fn new(num_players: usize) -> Self {
         if num_players < 2 || num_players > 8 {
             panic!("Number of players must be between 2 and 8");
         }
 
+        // Generate a full 52-card deck.
         let mut deck = Vec::with_capacity(52);
-        for suit in [Suit::Hearts, Suit::Diamonds, Suit::Clubs, Suit::Spades].iter() {
-            for rank in [
+        for &suit in &[Suit::Hearts, Suit::Diamonds, Suit::Clubs, Suit::Spades] {
+            for &rank in &[
                 Rank::Two, Rank::Three, Rank::Four, Rank::Five, Rank::Six, Rank::Seven,
                 Rank::Eight, Rank::Nine, Rank::Ten, Rank::Jack, Rank::Queen, Rank::King, Rank::Ace,
-            ].iter() {
-                deck.push(Card {
-                    suit: *suit,
-                    rank: *rank,
-                });
+            ] {
+                deck.push(Card { suit, rank });
             }
         }
-        
+
         let mut rng = rand::thread_rng();
         deck.shuffle(&mut rng);
 
         let mut players = Vec::with_capacity(num_players);
-        let mut used_cards = Vec::new();
-        
+        // Deal 2 cards per player.
         for _ in 0..num_players {
-            let card1 = deck.pop().unwrap();
-            let card2 = deck.pop().unwrap();
-            used_cards.push(card1);
-            used_cards.push(card2);
+            let card1 = deck.pop().expect("Deck should have enough cards");
+            let card2 = deck.pop().expect("Deck should have enough cards");
             players.push(Player {
                 cards: vec![card1, card2],
                 win_probability: 0.0,
@@ -283,156 +279,140 @@ impl GameState {
         game
     }
 
+    /// Updates win probabilities for all players based on the current state.
     fn update_probabilities(&mut self) {
         const NUM_SIMULATIONS: usize = 1000;
-        
-        // Early return if no players
-        if self.players.is_empty() {
-            return;
-        }
-        
-        // Calculate remaining deck (exclude all known cards)
-        let mut all_used_cards = Vec::new();
-        for player in &self.players {
-            all_used_cards.extend(player.cards.iter().cloned());
-        }
-        all_used_cards.extend(self.community_cards.iter().cloned());
-        
-        let mut remaining_deck = Vec::new();
-        for suit in [Suit::Hearts, Suit::Diamonds, Suit::Clubs, Suit::Spades].iter() {
-            for rank in [
-                Rank::Two, Rank::Three, Rank::Four, Rank::Five, Rank::Six, Rank::Seven,
-                Rank::Eight, Rank::Nine, Rank::Ten, Rank::Jack, Rank::Queen, Rank::King, Rank::Ace,
-            ].iter() {
-                let card = Card { suit: *suit, rank: *rank };
-                if !all_used_cards.contains(&card) {
-                    remaining_deck.push(card);
-                }
-            }
-        }
-        
-        // Calculate probabilities for each player
-        for i in 0..self.players.len() {
-            let player_cards = &self.players[i].cards;
-            
-            // Skip if player doesn't have exactly 2 cards
-            if player_cards.len() != 2 {
-                self.players[i].win_probability = 0.0;
+        // Use the current deck as the remaining deck.
+        let remaining_deck = self.deck.clone();
+
+        for (i, player) in self.players.iter_mut().enumerate() {
+            if player.cards.len() != 2 {
+                player.win_probability = 0.0;
                 continue;
             }
-            
-            let mut other_players_cards = Vec::new();
-            for (j, player) in self.players.iter().enumerate() {
-                if i != j && player.cards.len() == 2 {
-                    other_players_cards.push(player.cards.clone());
-                }
-            }
-            
+
+            // Gather opponents' cards.
+            let other_cards: Vec<Vec<Card>> = self.players
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, p)| p.cards.clone())
+                .collect();
+
             let prob = simulate_win_probability(
-                player_cards,
-                &other_players_cards,
+                &player.cards,
+                &other_cards,
                 &self.community_cards,
                 &remaining_deck,
-                NUM_SIMULATIONS
+                NUM_SIMULATIONS,
             );
-            self.players[i].win_probability = prob;
+            player.win_probability = prob;
         }
     }
 
+    /// Deals the flop (3 community cards) and updates probabilities.
     fn deal_flop(&mut self) {
         for _ in 0..3 {
-            self.community_cards.push(self.deck.pop().unwrap());
+            if let Some(card) = self.deck.pop() {
+                self.community_cards.push(card);
+            }
         }
         self.update_probabilities();
     }
 
+    /// Deals the turn (1 community card) and updates probabilities.
     fn deal_turn(&mut self) {
-        self.community_cards.push(self.deck.pop().unwrap());
+        if let Some(card) = self.deck.pop() {
+            self.community_cards.push(card);
+        }
         self.update_probabilities();
     }
 
+    /// Deals the river (1 community card) and updates probabilities.
     fn deal_river(&mut self) {
-        self.community_cards.push(self.deck.pop().unwrap());
+        if let Some(card) = self.deck.pop() {
+            self.community_cards.push(card);
+        }
         self.update_probabilities();
     }
 }
 
+// Global game state wrapped in a Mutex for thread safety.
 static GAME_STATE: Lazy<Mutex<Option<GameState>>> = Lazy::new(|| Mutex::new(None));
 
+/// Endpoint to create a new game.
 async fn new_game(Query(query): Query<NewGameQuery>) -> Json<GameState> {
     println!("Creating new game with {} players", query.num_players);
     let game = GameState::new(query.num_players);
-    
-    let mut state = GAME_STATE.lock().unwrap();
-    *state = Some(game.clone());
-    println!("New game created with {} cards in deck", game.deck.len());
+    {
+        let mut state = GAME_STATE.lock().unwrap();
+        *state = Some(game.clone());
+    }
     for (i, player) in game.players.iter().enumerate() {
         println!("Player {} cards: {:?} (win probability: {:.1}%)", 
             i + 1, player.cards, player.win_probability * 100.0);
     }
-    
     Json(game)
 }
 
+/// Endpoint to deal the flop.
 async fn deal_flop() -> Json<GameState> {
     let mut state = GAME_STATE.lock().unwrap();
     if let Some(ref mut game) = *state {
         println!("Dealing flop");
         game.deal_flop();
-        println!("Community cards after flop: {:?}", game.community_cards);
+        println!("Community cards: {:?}", game.community_cards);
         for (i, player) in game.players.iter().enumerate() {
             println!("Player {} win probability: {:.1}%", 
                 i + 1, player.win_probability * 100.0);
         }
         return Json(game.clone());
     }
-    println!("No game state found for flop");
     Json(GameState::new(2))
 }
 
+/// Endpoint to deal the turn.
 async fn deal_turn() -> Json<GameState> {
     let mut state = GAME_STATE.lock().unwrap();
     if let Some(ref mut game) = *state {
         println!("Dealing turn");
         game.deal_turn();
-        println!("Community cards after turn: {:?}", game.community_cards);
+        println!("Community cards: {:?}", game.community_cards);
         for (i, player) in game.players.iter().enumerate() {
             println!("Player {} win probability: {:.1}%", 
                 i + 1, player.win_probability * 100.0);
         }
         return Json(game.clone());
     }
-    println!("No game state found for turn");
     Json(GameState::new(2))
 }
 
+/// Endpoint to deal the river.
 async fn deal_river() -> Json<GameState> {
     let mut state = GAME_STATE.lock().unwrap();
     if let Some(ref mut game) = *state {
         println!("Dealing river");
         game.deal_river();
-        println!("Community cards after river: {:?}", game.community_cards);
+        println!("Community cards: {:?}", game.community_cards);
         for (i, player) in game.players.iter().enumerate() {
             println!("Player {} win probability: {:.1}%", 
                 i + 1, player.win_probability * 100.0);
         }
         return Json(game.clone());
     }
-    println!("No game state found for river");
     Json(GameState::new(2))
 }
 
 #[tokio::main]
 async fn main() {
     println!("Starting poker server...");
-    
+
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
         .allow_origin(Any);
 
     let app = Router::new()
-        .route("/new-game", get(new_game
-        ))
+        .route("/new-game", get(new_game))
         .route("/deal-flop", get(deal_flop))
         .route("/deal-turn", get(deal_turn))
         .route("/deal-river", get(deal_river))
