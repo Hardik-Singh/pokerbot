@@ -2,37 +2,54 @@ use axum::{
     routing::{get, post},
     Router, Json,
     http::Method,
-    extract::Query,
+    extract::{Query, Json as JsonExtractor},
 };
 use serde::{Deserialize, Serialize};
 use rand::seq::SliceRandom;
-use tower_http::cors::{CorsLayer, Any};
+use tower_http::cors::{CorsLayer, Any, AllowHeaders};
 use std::sync::Mutex;
 use once_cell::sync::Lazy;
 use std::cmp::Ordering;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Suit {
+    #[serde(rename = "Hearts")]
     Hearts,
+    #[serde(rename = "Diamonds")]
     Diamonds,
+    #[serde(rename = "Clubs")]
     Clubs,
+    #[serde(rename = "Spades")]
     Spades,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Rank {
+    #[serde(rename = "Two")]
     Two,
+    #[serde(rename = "Three")]
     Three,
+    #[serde(rename = "Four")]
     Four,
+    #[serde(rename = "Five")]
     Five,
+    #[serde(rename = "Six")]
     Six,
+    #[serde(rename = "Seven")]
     Seven,
+    #[serde(rename = "Eight")]
     Eight,
+    #[serde(rename = "Nine")]
     Nine,
+    #[serde(rename = "Ten")]
     Ten,
+    #[serde(rename = "Jack")]
     Jack,
+    #[serde(rename = "Queen")]
     Queen,
+    #[serde(rename = "King")]
     King,
+    #[serde(rename = "Ace")]
     Ace,
 }
 
@@ -46,6 +63,9 @@ pub struct Card {
 pub struct Player {
     cards: Vec<Card>,
     win_probability: f64,
+    chips: u32,
+    is_robot: bool,
+    name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,11 +73,53 @@ pub struct GameState {
     deck: Vec<Card>,
     players: Vec<Player>,
     community_cards: Vec<Card>,
+    pot: u32,
+    current_bet: u32,
+    game_mode: GameMode,
+    current_player: usize,
+    last_action: Option<Action>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum GameMode {
+    #[serde(rename = "Simulation")]
+    Simulation,
+    #[serde(rename = "RobotPlay")]
+    RobotPlay,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Action {
+    player_index: usize,
+    action_type: ActionType,
+    amount: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ActionType {
+    #[serde(rename = "Fold")]
+    Fold,
+    #[serde(rename = "Check")]
+    Check,
+    #[serde(rename = "Call")]
+    Call,
+    #[serde(rename = "Bet")]
+    Bet,
+    #[serde(rename = "Raise")]
+    Raise,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct NewGameQuery {
     num_players: usize,
+    game_mode: GameMode,
+    starting_chips: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlayerAction {
+    action_type: ActionType,
+    amount: Option<u32>,
 }
 
 impl Card {
@@ -193,7 +255,7 @@ fn simulate_win_probability(
     other_players_cards: &[Vec<Card>],
     community_cards: &[Card],
     remaining_deck: &[Card],
-    num_simulations: 1000000,
+    num_simulations: usize,
 ) -> f64 {
     // If there are no opponents, the win probability is 100%.
     if other_players_cards.is_empty() {
@@ -217,12 +279,16 @@ fn simulate_win_probability(
         final_board.extend(sim_deck.into_iter().take(total_needed));
 
         // Evaluate best hand for the player.
-        let player_best = evaluate_best_hand(&[player_cards, &final_board].concat());
+        let mut player_and_board = player_cards.to_vec();
+        player_and_board.extend(final_board.iter().cloned());
+        let player_best = evaluate_best_hand(&player_and_board);
 
         // Evaluate each opponent's best hand.
         let mut all_hands = vec![player_best.clone()];
         for other in other_players_cards {
-            let other_best = evaluate_best_hand(&[other, &final_board].concat());
+            let mut other_and_board = other.clone();
+            other_and_board.extend(final_board.iter().cloned());
+            let other_best = evaluate_best_hand(&other_and_board);
             all_hands.push(other_best);
         }
 
@@ -240,7 +306,7 @@ fn simulate_win_probability(
 
 impl GameState {
     /// Creates a new game with the specified number of players (between 2 and 8).
-    fn new(num_players: usize) -> Self {
+    fn new(num_players: usize, game_mode: GameMode, starting_chips: u32) -> Self {
         if num_players < 2 || num_players > 8 {
             panic!("Number of players must be between 2 and 8");
         }
@@ -261,12 +327,16 @@ impl GameState {
 
         let mut players = Vec::with_capacity(num_players);
         // Deal 2 cards per player.
-        for _ in 0..num_players {
+        for i in 0..num_players {
             let card1 = deck.pop().expect("Deck should have enough cards");
             let card2 = deck.pop().expect("Deck should have enough cards");
+            let is_robot = i > 0; // First player is human, rest are robots
             players.push(Player {
                 cards: vec![card1, card2],
                 win_probability: 0.0,
+                chips: starting_chips,
+                is_robot,
+                name: if is_robot { format!("Robot {}", i) } else { "You".to_string() },
             });
         }
 
@@ -274,6 +344,11 @@ impl GameState {
             deck,
             players,
             community_cards: Vec::new(),
+            pot: 0,
+            current_bet: 0,
+            game_mode,
+            current_player: 0,
+            last_action: None,
         };
         game.update_probabilities();
         game
@@ -285,23 +360,30 @@ impl GameState {
         // Use the current deck as the remaining deck.
         let remaining_deck = self.deck.clone();
 
+        // First collect all opponent cards for each player
+        let opponent_cards: Vec<Vec<Vec<Card>>> = self.players
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                self.players
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, _)| j != i)
+                    .map(|(_, p)| p.cards.clone())
+                    .collect()
+            })
+            .collect();
+
+        // Then update probabilities
         for (i, player) in self.players.iter_mut().enumerate() {
             if player.cards.len() != 2 {
                 player.win_probability = 0.0;
                 continue;
             }
 
-            // Gather opponents' cards.
-            let other_cards: Vec<Vec<Card>> = self.players
-                .iter()
-                .enumerate()
-                .filter(|&(j, _)| j != i)
-                .map(|(_, p)| p.cards.clone())
-                .collect();
-
             let prob = simulate_win_probability(
                 &player.cards,
-                &other_cards,
+                &opponent_cards[i],
                 &self.community_cards,
                 &remaining_deck,
                 NUM_SIMULATIONS,
@@ -335,6 +417,123 @@ impl GameState {
         }
         self.update_probabilities();
     }
+
+    fn handle_action(&mut self, action: Action) -> Result<(), String> {
+        let player = &mut self.players[action.player_index];
+        
+        match action.action_type {
+            ActionType::Fold => {
+                // Remove player from current hand
+                player.cards.clear();
+            },
+            ActionType::Check => {
+                if self.current_bet > 0 {
+                    return Err("Cannot check when there's a bet".to_string());
+                }
+            },
+            ActionType::Call => {
+                let call_amount = self.current_bet;
+                println!("Call amount: {}, Player chips: {}", call_amount, player.chips);
+                if player.chips < call_amount {
+                    return Err("Not enough chips to call".to_string());
+                }
+                player.chips -= call_amount;
+                self.pot += call_amount;
+            },
+            ActionType::Bet => {
+                let amount = action.amount.ok_or("Bet amount required")?;
+                if amount <= self.current_bet {
+                    return Err("Bet must be higher than current bet".to_string());
+                }
+                if player.chips < amount {
+                    return Err("Not enough chips to bet".to_string());
+                }
+                player.chips -= amount;
+                self.pot += amount;
+                self.current_bet = amount;
+            },
+            ActionType::Raise => {
+                let amount = action.amount.ok_or("Raise amount required")?;
+                if amount <= self.current_bet {
+                    return Err("Raise must be higher than current bet".to_string());
+                }
+                if player.chips < amount {
+                    return Err("Not enough chips to raise".to_string());
+                }
+                player.chips -= amount;
+                self.pot += amount;
+                self.current_bet = amount;
+            },
+        }
+
+        self.last_action = Some(action);
+        
+        // Move to next player
+        self.current_player = (self.current_player + 1) % self.players.len();
+        
+        // If it's a robot's turn, make them act
+        if self.players[self.current_player].is_robot {
+            self.handle_robot_action()?;
+        }
+        
+        Ok(())
+    }
+
+    fn handle_robot_action(&mut self) -> Result<(), String> {
+        let robot = &self.players[self.current_player];
+        if !robot.is_robot {
+            return Ok(());
+        }
+
+        // Simple random strategy for now
+        let action = if self.current_bet == 0 {
+            // Can check or bet
+            if rand::random::<f64>() < 0.7 {
+                // 70% chance to check
+                Action {
+                    player_index: self.current_player,
+                    action_type: ActionType::Check,
+                    amount: None,
+                }
+            } else {
+                // Random bet between 1/4 and 1/2 of pot
+                let bet_amount = (self.pot / 4) + rand::random::<u32>() % (self.pot / 4);
+                Action {
+                    player_index: self.current_player,
+                    action_type: ActionType::Bet,
+                    amount: Some(bet_amount),
+                }
+            }
+        } else {
+            // Must fold, call, or raise
+            let r = rand::random::<f64>();
+            if r < 0.3 {
+                // 30% chance to fold
+                Action {
+                    player_index: self.current_player,
+                    action_type: ActionType::Fold,
+                    amount: None,
+                }
+            } else if r < 0.6 {
+                // 30% chance to call
+                Action {
+                    player_index: self.current_player,
+                    action_type: ActionType::Call,
+                    amount: None,
+                }
+            } else {
+                // 40% chance to raise
+                let raise_amount = self.current_bet * 2;
+                Action {
+                    player_index: self.current_player,
+                    action_type: ActionType::Raise,
+                    amount: Some(raise_amount),
+                }
+            }
+        };
+
+        self.handle_action(action)
+    }
 }
 
 // Global game state wrapped in a Mutex for thread safety.
@@ -342,17 +541,43 @@ static GAME_STATE: Lazy<Mutex<Option<GameState>>> = Lazy::new(|| Mutex::new(None
 
 /// Endpoint to create a new game.
 async fn new_game(Query(query): Query<NewGameQuery>) -> Json<GameState> {
-    println!("Creating new game with {} players", query.num_players);
-    let game = GameState::new(query.num_players);
+    println!("Creating new game with {} players in {:?} mode", query.num_players, query.game_mode);
+    let game = GameState::new(query.num_players, query.game_mode, query.starting_chips);
     {
         let mut state = GAME_STATE.lock().unwrap();
         *state = Some(game.clone());
     }
-    for (i, player) in game.players.iter().enumerate() {
-        println!("Player {} cards: {:?} (win probability: {:.1}%)", 
-            i + 1, player.cards, player.win_probability * 100.0);
-    }
+    println!("Game created successfully");
     Json(game)
+}
+
+/// Endpoint to handle player actions
+async fn player_action(
+    JsonExtractor(action): JsonExtractor<PlayerAction>,
+) -> Json<Result<GameState, String>> {
+    println!("Received player action: {:?}", action);
+    let mut state = GAME_STATE.lock().unwrap();
+    if let Some(ref mut game) = *state {
+        let action = Action {
+            player_index: 0, // Human player is always index 0
+            action_type: action.action_type,
+            amount: action.amount,
+        };
+        
+        match game.handle_action(action) {
+            Ok(_) => {
+                println!("Action handled successfully");
+                Json(Ok(game.clone()))
+            },
+            Err(e) => {
+                println!("Error handling action: {}", e);
+                Json(Err(e))
+            },
+        }
+    } else {
+        println!("No active game found");
+        Json(Err("No active game".to_string()))
+    }
 }
 
 /// Endpoint to deal the flop.
@@ -368,7 +593,7 @@ async fn deal_flop() -> Json<GameState> {
         }
         return Json(game.clone());
     }
-    Json(GameState::new(2))
+    Json(GameState::new(2, GameMode::Simulation, 1000))
 }
 
 /// Endpoint to deal the turn.
@@ -384,7 +609,7 @@ async fn deal_turn() -> Json<GameState> {
         }
         return Json(game.clone());
     }
-    Json(GameState::new(2))
+    Json(GameState::new(2, GameMode::Simulation, 1000))
 }
 
 /// Endpoint to deal the river.
@@ -400,7 +625,7 @@ async fn deal_river() -> Json<GameState> {
         }
         return Json(game.clone());
     }
-    Json(GameState::new(2))
+    Json(GameState::new(2, GameMode::Simulation, 1000))
 }
 
 #[tokio::main]
@@ -409,10 +634,12 @@ async fn main() {
 
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
-        .allow_origin(Any);
+        .allow_origin(Any)
+        .allow_headers(AllowHeaders::any());
 
     let app = Router::new()
         .route("/new-game", get(new_game))
+        .route("/player-action", post(player_action))
         .route("/deal-flop", get(deal_flop))
         .route("/deal-turn", get(deal_turn))
         .route("/deal-river", get(deal_river))
