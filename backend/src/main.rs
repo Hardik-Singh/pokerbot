@@ -66,6 +66,18 @@ pub struct Player {
     chips: u32,
     is_robot: bool,
     name: String,
+    current_bet: u32,  // Track current bet for this round
+    personality: Option<RobotPersonality>,  // Only for robots
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RobotPersonality {
+    name: String,
+    emoji: String,
+    style: String,
+    description: String,
+    aggression: f64,  // 0.0 to 1.0
+    bluff_frequency: f64,  // 0.0 to 1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,18 +337,65 @@ impl GameState {
         let mut rng = rand::thread_rng();
         deck.shuffle(&mut rng);
 
+        let robot_personalities = vec![
+            RobotPersonality {
+                name: "PokerBot 3000".to_string(),
+                emoji: "🤖".to_string(),
+                style: "Calculating".to_string(),
+                description: "A cold, calculating machine that plays by the numbers".to_string(),
+                aggression: 0.7,
+                bluff_frequency: 0.3,
+            },
+            RobotPersonality {
+                name: "Lucky Larry".to_string(),
+                emoji: "🍀".to_string(),
+                style: "Lucky".to_string(),
+                description: "Always seems to get the cards he needs".to_string(),
+                aggression: 0.5,
+                bluff_frequency: 0.6,
+            },
+            RobotPersonality {
+                name: "Bluff Master".to_string(),
+                emoji: "🎭".to_string(),
+                style: "Deceptive".to_string(),
+                description: "Loves to bluff and keep you guessing".to_string(),
+                aggression: 0.8,
+                bluff_frequency: 0.8,
+            },
+            RobotPersonality {
+                name: "Safe Sally".to_string(),
+                emoji: "🛡️".to_string(),
+                style: "Conservative".to_string(),
+                description: "Plays it safe and waits for good hands".to_string(),
+                aggression: 0.3,
+                bluff_frequency: 0.2,
+            },
+        ];
+
         let mut players = Vec::with_capacity(num_players);
-        // Deal 2 cards per player.
         for i in 0..num_players {
             let card1 = deck.pop().expect("Deck should have enough cards");
             let card2 = deck.pop().expect("Deck should have enough cards");
-            let is_robot = i > 0; // First player is human, rest are robots
+            let is_robot = i > 0;
+            
+            let personality = if is_robot {
+                Some(robot_personalities[i % robot_personalities.len()].clone())
+            } else {
+                None
+            };
+
             players.push(Player {
                 cards: vec![card1, card2],
                 win_probability: 0.0,
                 chips: starting_chips,
                 is_robot,
-                name: if is_robot { format!("Robot {}", i) } else { "You".to_string() },
+                name: if is_robot {
+                    format!("{} {}", personality.as_ref().unwrap().emoji, personality.as_ref().unwrap().name)
+                } else {
+                    "You".to_string()
+                },
+                current_bet: 0,
+                personality,
             });
         }
 
@@ -423,7 +482,6 @@ impl GameState {
         
         match action.action_type {
             ActionType::Fold => {
-                // Remove player from current hand
                 player.cards.clear();
             },
             ActionType::Check => {
@@ -432,13 +490,13 @@ impl GameState {
                 }
             },
             ActionType::Call => {
-                let call_amount = self.current_bet;
-                println!("Call amount: {}, Player chips: {}", call_amount, player.chips);
+                let call_amount = self.current_bet.saturating_sub(player.current_bet);
                 if player.chips < call_amount {
                     return Err("Not enough chips to call".to_string());
                 }
                 player.chips -= call_amount;
                 self.pot += call_amount;
+                player.current_bet += call_amount;
             },
             ActionType::Bet => {
                 let amount = action.amount.ok_or("Bet amount required")?;
@@ -451,6 +509,7 @@ impl GameState {
                 player.chips -= amount;
                 self.pot += amount;
                 self.current_bet = amount;
+                player.current_bet = amount;
             },
             ActionType::Raise => {
                 let amount = action.amount.ok_or("Raise amount required")?;
@@ -463,6 +522,7 @@ impl GameState {
                 player.chips -= amount;
                 self.pot += amount;
                 self.current_bet = amount;
+                player.current_bet = amount;
             },
         }
 
@@ -485,19 +545,22 @@ impl GameState {
             return Ok(());
         }
 
-        // Simple random strategy for now
+        let personality = robot.personality.as_ref().unwrap();
+        let mut rng = rand::thread_rng();
+        
+        // Calculate action based on personality and game state
         let action = if self.current_bet == 0 {
             // Can check or bet
-            if rand::random::<f64>() < 0.7 {
-                // 70% chance to check
+            if rng.gen::<f64>() < (1.0 - personality.aggression) {
+                // More likely to check if less aggressive
                 Action {
                     player_index: self.current_player,
                     action_type: ActionType::Check,
                     amount: None,
                 }
             } else {
-                // Random bet between 1/4 and 1/2 of pot
-                let bet_amount = (self.pot / 4) + rand::random::<u32>() % (self.pot / 4);
+                // Bet based on aggression level
+                let bet_amount = (self.pot as f64 * personality.aggression * 0.5) as u32;
                 Action {
                     player_index: self.current_player,
                     action_type: ActionType::Bet,
@@ -506,24 +569,24 @@ impl GameState {
             }
         } else {
             // Must fold, call, or raise
-            let r = rand::random::<f64>();
-            if r < 0.3 {
-                // 30% chance to fold
+            let r = rng.gen::<f64>();
+            if r < (1.0 - personality.aggression) * 0.5 {
+                // More likely to fold if less aggressive
                 Action {
                     player_index: self.current_player,
                     action_type: ActionType::Fold,
                     amount: None,
                 }
-            } else if r < 0.6 {
-                // 30% chance to call
+            } else if r < (1.0 - personality.aggression) {
+                // More likely to call if less aggressive
                 Action {
                     player_index: self.current_player,
                     action_type: ActionType::Call,
                     amount: None,
                 }
             } else {
-                // 40% chance to raise
-                let raise_amount = self.current_bet * 2;
+                // Raise based on aggression level
+                let raise_amount = (self.current_bet as f64 * (1.0 + personality.aggression)) as u32;
                 Action {
                     player_index: self.current_player,
                     action_type: ActionType::Raise,

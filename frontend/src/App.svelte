@@ -269,10 +269,14 @@
             <div class="player-section" class:current-player={i === gameState.current_player}>
               <div class="player-header">
                 <h3>{player.name}</h3>
+                {#if player.is_robot && player.personality}
+                  <div class="robot-personality">
+                    <div class="style">{player.personality.style}</div>
+                    <div class="description">{player.personality.description}</div>
+                  </div>
+                {/if}
                 <div class="player-info">
-                  {#if gameMode === 'RobotPlay'}
-                    <div class="chips">${player.chips}</div>
-                  {/if}
+                  <div class="chips">${player.chips}</div>
                   {#if !player.is_robot || showRobotCards}
                     <div class="win-probability">
                       <div class="probability-value">{(player.win_probability * 100).toFixed(1)}%</div>
@@ -895,5 +899,20 @@
     font-weight: bold;
     text-transform: uppercase;
     letter-spacing: 1px;
+  }
+
+  .robot-personality {
+    font-size: 0.9em;
+    color: #666;
+    margin: 5px 0;
+  }
+  
+  .robot-personality .style {
+    font-weight: bold;
+    color: #4CAF50;
+  }
+  
+  .robot-personality .description {
+    font-style: italic;
   }
 </style>
