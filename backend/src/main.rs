@@ -10,6 +10,7 @@ use tower_http::cors::{CorsLayer, Any, AllowHeaders};
 use std::sync::Mutex;
 use once_cell::sync::Lazy;
 use std::cmp::Ordering;
+use chrono;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Suit {
@@ -76,8 +77,30 @@ pub struct RobotPersonality {
     emoji: String,
     style: String,
     description: String,
-    aggression: f64,  // 0.0 to 1.0
-    bluff_frequency: f64,  // 0.0 to 1.0
+    aggression: f64,
+    bluff_frequency: f64,
+    patience: f64,
+    risk_tolerance: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayerStats {
+    games_played: u32,
+    games_won: u32,
+    total_profit: i32,
+    biggest_pot: u32,
+    best_hand: String,
+    favorite_action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameStats {
+    start_time: chrono::DateTime<chrono::Utc>,
+    end_time: Option<chrono::DateTime<chrono::Utc>>,
+    players: Vec<PlayerStats>,
+    total_hands: u32,
+    average_pot: u32,
+    biggest_pot: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +113,8 @@ pub struct GameState {
     game_mode: GameMode,
     current_player: usize,
     last_action: Option<Action>,
+    stats: GameStats,
+    hand_history: Vec<HandHistory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -345,6 +370,8 @@ impl GameState {
                 description: "A cold, calculating machine that plays by the numbers".to_string(),
                 aggression: 0.7,
                 bluff_frequency: 0.3,
+                patience: 0.8,
+                risk_tolerance: 0.6,
             },
             RobotPersonality {
                 name: "Lucky Larry".to_string(),
@@ -353,6 +380,8 @@ impl GameState {
                 description: "Always seems to get the cards he needs".to_string(),
                 aggression: 0.5,
                 bluff_frequency: 0.6,
+                patience: 0.4,
+                risk_tolerance: 0.8,
             },
             RobotPersonality {
                 name: "Bluff Master".to_string(),
@@ -361,6 +390,8 @@ impl GameState {
                 description: "Loves to bluff and keep you guessing".to_string(),
                 aggression: 0.8,
                 bluff_frequency: 0.8,
+                patience: 0.3,
+                risk_tolerance: 0.9,
             },
             RobotPersonality {
                 name: "Safe Sally".to_string(),
@@ -369,6 +400,8 @@ impl GameState {
                 description: "Plays it safe and waits for good hands".to_string(),
                 aggression: 0.3,
                 bluff_frequency: 0.2,
+                patience: 0.9,
+                risk_tolerance: 0.3,
             },
         ];
 
@@ -408,6 +441,22 @@ impl GameState {
             game_mode,
             current_player: 0,
             last_action: None,
+            stats: GameStats {
+                start_time: chrono::Utc::now(),
+                end_time: None,
+                players: vec![PlayerStats {
+                    games_played: 0,
+                    games_won: 0,
+                    total_profit: 0,
+                    biggest_pot: 0,
+                    best_hand: String::new(),
+                    favorite_action: String::new(),
+                }; num_players],
+                total_hands: 0,
+                average_pot: 0,
+                biggest_pot: 0,
+            },
+            hand_history: Vec::new(),
         };
         game.update_probabilities();
         game
@@ -536,6 +585,8 @@ impl GameState {
             self.handle_robot_action()?;
         }
         
+        self.update_stats(&action);
+        
         Ok(())
     }
 
@@ -545,24 +596,20 @@ impl GameState {
             return Ok(());
         }
 
-        let personality = robot.personality.as_ref().unwrap();
+        let personality = self.get_robot_personality();
         let mut rng = rand::thread_rng();
         
         // Calculate action based on personality and game state
         let action = if self.current_bet == 0 {
             // Can check or bet
             if rng.gen::<f64>() < (1.0 - personality.aggression) {
-                // More likely to check if less aggressive
-                Action {
-                    player_index: self.current_player,
+                PlayerAction {
                     action_type: ActionType::Check,
                     amount: None,
                 }
             } else {
-                // Bet based on aggression level
                 let bet_amount = (self.pot as f64 * personality.aggression * 0.5) as u32;
-                Action {
-                    player_index: self.current_player,
+                PlayerAction {
                     action_type: ActionType::Bet,
                     amount: Some(bet_amount),
                 }
@@ -571,24 +618,18 @@ impl GameState {
             // Must fold, call, or raise
             let r = rng.gen::<f64>();
             if r < (1.0 - personality.aggression) * 0.5 {
-                // More likely to fold if less aggressive
-                Action {
-                    player_index: self.current_player,
+                PlayerAction {
                     action_type: ActionType::Fold,
                     amount: None,
                 }
             } else if r < (1.0 - personality.aggression) {
-                // More likely to call if less aggressive
-                Action {
-                    player_index: self.current_player,
+                PlayerAction {
                     action_type: ActionType::Call,
                     amount: None,
                 }
             } else {
-                // Raise based on aggression level
                 let raise_amount = (self.current_bet as f64 * (1.0 + personality.aggression)) as u32;
-                Action {
-                    player_index: self.current_player,
+                PlayerAction {
                     action_type: ActionType::Raise,
                     amount: Some(raise_amount),
                 }
@@ -597,6 +638,108 @@ impl GameState {
 
         self.handle_action(action)
     }
+
+    fn get_robot_personality(&self) -> RobotPersonality {
+        let personalities = vec![
+            RobotPersonality {
+                name: "PokerBot 3000".to_string(),
+                emoji: "🤖".to_string(),
+                style: "Calculating".to_string(),
+                description: "A cold, calculating machine that plays by the numbers".to_string(),
+                aggression: 0.7,
+                bluff_frequency: 0.3,
+                patience: 0.8,
+                risk_tolerance: 0.6,
+            },
+            RobotPersonality {
+                name: "Lucky Larry".to_string(),
+                emoji: "🍀".to_string(),
+                style: "Lucky".to_string(),
+                description: "Always seems to get the cards he needs".to_string(),
+                aggression: 0.5,
+                bluff_frequency: 0.6,
+                patience: 0.4,
+                risk_tolerance: 0.8,
+            },
+            RobotPersonality {
+                name: "Bluff Master".to_string(),
+                emoji: "🎭".to_string(),
+                style: "Deceptive".to_string(),
+                description: "Loves to bluff and keep you guessing".to_string(),
+                aggression: 0.8,
+                bluff_frequency: 0.8,
+                patience: 0.3,
+                risk_tolerance: 0.9,
+            },
+            RobotPersonality {
+                name: "Safe Sally".to_string(),
+                emoji: "🛡️".to_string(),
+                style: "Conservative".to_string(),
+                description: "Plays it safe and waits for good hands".to_string(),
+                aggression: 0.3,
+                bluff_frequency: 0.2,
+                patience: 0.9,
+                risk_tolerance: 0.3,
+            },
+        ];
+
+        personalities[self.current_player % personalities.len()].clone()
+    }
+
+    fn update_stats(&mut self, action: &Action) {
+        if let Some(player) = self.players.get_mut(action.player_index) {
+            let stats = &mut self.stats.players[action.player_index];
+            stats.games_played += 1;
+            
+            match action.action_type {
+                ActionType::Bet | ActionType::Raise => {
+                    stats.favorite_action = "Aggressive".to_string();
+                },
+                ActionType::Check | ActionType::Call => {
+                    stats.favorite_action = "Conservative".to_string();
+                },
+                _ => {}
+            }
+            
+            if self.pot > stats.biggest_pot {
+                stats.biggest_pot = self.pot;
+            }
+        }
+    }
+
+    fn record_action(&mut self, action: &Action) {
+        if let Some(current_hand) = self.hand_history.last_mut() {
+            current_hand.actions.push(action.clone());
+            current_hand.pot_size = self.pot;
+            current_hand.community_cards = self.community_cards.clone();
+            current_hand.player_cards = self.players.iter()
+                .map(|p| p.cards.clone())
+                .collect();
+        }
+    }
+    
+    fn start_new_hand(&mut self) {
+        self.hand_history.push(HandHistory {
+            timestamp: chrono::Utc::now(),
+            phase: self.phase.clone(),
+            actions: Vec::new(),
+            pot_size: 0,
+            community_cards: Vec::new(),
+            player_cards: Vec::new(),
+            winner: None,
+        });
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandHistory {
+    timestamp: chrono::DateTime<chrono::Utc>,
+    phase: GamePhase,
+    actions: Vec<Action>,
+    pot_size: u32,
+    community_cards: Vec<Card>,
+    player_cards: Vec<Vec<Card>>,
+    winner: Option<usize>,
 }
 
 // Global game state wrapped in a Mutex for thread safety.
