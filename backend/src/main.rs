@@ -2,7 +2,7 @@ use axum::{
     routing::{get, post},
     Router, Json,
     http::Method,
-    extract::{Query, Json as JsonExtractor},
+    extract::{Query, Json as JsonExtractor, State},
 };
 use serde::{Deserialize, Serialize};
 use rand::seq::SliceRandom;
@@ -11,6 +11,9 @@ use std::sync::Mutex;
 use once_cell::sync::Lazy;
 use std::cmp::Ordering;
 use chrono;
+use rand::Rng;
+use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Suit {
@@ -575,7 +578,7 @@ impl GameState {
             },
         }
 
-        self.last_action = Some(action);
+        self.last_action = Some(action.clone());
         
         // Move to next player
         self.current_player = (self.current_player + 1) % self.players.len();
@@ -599,37 +602,39 @@ impl GameState {
         let personality = self.get_robot_personality();
         let mut rng = rand::thread_rng();
         
-        // Calculate action based on personality and game state
         let action = if self.current_bet == 0 {
-            // Can check or bet
             if rng.gen::<f64>() < (1.0 - personality.aggression) {
-                PlayerAction {
+                Action {
+                    player_index: self.current_player,
                     action_type: ActionType::Check,
                     amount: None,
                 }
             } else {
                 let bet_amount = (self.pot as f64 * personality.aggression * 0.5) as u32;
-                PlayerAction {
+                Action {
+                    player_index: self.current_player,
                     action_type: ActionType::Bet,
                     amount: Some(bet_amount),
                 }
             }
         } else {
-            // Must fold, call, or raise
             let r = rng.gen::<f64>();
             if r < (1.0 - personality.aggression) * 0.5 {
-                PlayerAction {
+                Action {
+                    player_index: self.current_player,
                     action_type: ActionType::Fold,
                     amount: None,
                 }
             } else if r < (1.0 - personality.aggression) {
-                PlayerAction {
+                Action {
+                    player_index: self.current_player,
                     action_type: ActionType::Call,
                     amount: None,
                 }
             } else {
                 let raise_amount = (self.current_bet as f64 * (1.0 + personality.aggression)) as u32;
-                PlayerAction {
+                Action {
+                    player_index: self.current_player,
                     action_type: ActionType::Raise,
                     amount: Some(raise_amount),
                 }
@@ -721,7 +726,7 @@ impl GameState {
     fn start_new_hand(&mut self) {
         self.hand_history.push(HandHistory {
             timestamp: chrono::Utc::now(),
-            phase: self.phase.clone(),
+            phase: GamePhase::PreFlop,
             actions: Vec::new(),
             pot_size: 0,
             community_cards: Vec::new(),
@@ -742,15 +747,24 @@ pub struct HandHistory {
     winner: Option<usize>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GamePhase {
+    PreFlop,
+    Flop,
+    Turn,
+    River,
+    Showdown,
+}
+
 // Global game state wrapped in a Mutex for thread safety.
-static GAME_STATE: Lazy<Mutex<Option<GameState>>> = Lazy::new(|| Mutex::new(None));
+static GAME_STATE: Lazy<TokioMutex<Option<GameState>>> = Lazy::new(|| TokioMutex::new(None));
 
 /// Endpoint to create a new game.
 async fn new_game(Query(query): Query<NewGameQuery>) -> Json<GameState> {
     println!("Creating new game with {} players in {:?} mode", query.num_players, query.game_mode);
     let game = GameState::new(query.num_players, query.game_mode, query.starting_chips);
     {
-        let mut state = GAME_STATE.lock().unwrap();
+        let mut state = GAME_STATE.lock().await;
         *state = Some(game.clone());
     }
     println!("Game created successfully");
@@ -762,7 +776,7 @@ async fn player_action(
     JsonExtractor(action): JsonExtractor<PlayerAction>,
 ) -> Json<Result<GameState, String>> {
     println!("Received player action: {:?}", action);
-    let mut state = GAME_STATE.lock().unwrap();
+    let mut state = GAME_STATE.lock().await;
     if let Some(ref mut game) = *state {
         let action = Action {
             player_index: 0, // Human player is always index 0
@@ -788,7 +802,7 @@ async fn player_action(
 
 /// Endpoint to deal the flop.
 async fn deal_flop() -> Json<GameState> {
-    let mut state = GAME_STATE.lock().unwrap();
+    let mut state = GAME_STATE.lock().await;
     if let Some(ref mut game) = *state {
         println!("Dealing flop");
         game.deal_flop();
@@ -804,7 +818,7 @@ async fn deal_flop() -> Json<GameState> {
 
 /// Endpoint to deal the turn.
 async fn deal_turn() -> Json<GameState> {
-    let mut state = GAME_STATE.lock().unwrap();
+    let mut state = GAME_STATE.lock().await;
     if let Some(ref mut game) = *state {
         println!("Dealing turn");
         game.deal_turn();
@@ -820,7 +834,7 @@ async fn deal_turn() -> Json<GameState> {
 
 /// Endpoint to deal the river.
 async fn deal_river() -> Json<GameState> {
-    let mut state = GAME_STATE.lock().unwrap();
+    let mut state = GAME_STATE.lock().await;
     if let Some(ref mut game) = *state {
         println!("Dealing river");
         game.deal_river();
